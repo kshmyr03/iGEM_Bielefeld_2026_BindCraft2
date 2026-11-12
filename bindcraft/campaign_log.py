@@ -1,7 +1,8 @@
 import math
 import os
 from importlib.metadata import PackageNotFoundError, version
-from bindcraft.protein import recorded_number
+from bindcraft.protein import AMINO_ACIDS, Protein, ResidueFlags, has_residue_flag, recorded_number
+import numpy as np
 
 def released_version() -> str:
     """The version every output is stamped with, read from the installed package so it cannot drift from pyproject."""
@@ -223,3 +224,103 @@ def length_choices(lengths) -> str:
         return ' or '.join(str(length) for length in ordered)
     spacing = spacings.pop()
     return f'{ordered[0]} to {ordered[-1]}' + ('' if spacing == 1 else f' every {spacing}')
+
+"""One-time warm start diagnostic. Append to bindcraft/campaign_log.py.
+ 
+Prints once per process, on the first trajectory, so a misconfigured warm start is
+visible immediately instead of running 750 trajectories that silently behave like a
+de novo campaign.
+"""
+
+_BACKBONE_ATOMS = {'N': 0, 'CA': 1, 'C': 2}   # AF2 37-atom ordering
+_LOGIT_SCALE = 2.0                            # design default, for the softmax preview
+_warm_start_reported = False
+ 
+ 
+def _chain_report(chain_name: str, protein: Protein) -> list[str]:
+    atoms = np.asarray(protein.atoms, dtype=np.float32)
+    mask = np.asarray(protein.atom_mask, dtype=bool)
+    flags = np.asarray(protein.flags)
+    logits = np.asarray(protein.sequence, dtype=np.float32)
+    length = len(protein)
+ 
+    backbone = atoms[:, [_BACKBONE_ATOMS['N'], _BACKBONE_ATOMS['CA'], _BACKBONE_ATOMS['C']]]
+    resolved = int(mask[:, _BACKBONE_ATOMS['CA']].sum())
+    nonzero = int((np.abs(backbone).sum(axis=(1, 2)) > 1e-6).sum())
+    alpha_carbons = atoms[:, _BACKBONE_ATOMS['CA']]
+    centroid = alpha_carbons.mean(axis=0)
+    radius = float(np.sqrt(((alpha_carbons - centroid) ** 2).sum(axis=-1).mean()))
+ 
+    scaled = logits * _LOGIT_SCALE
+    scaled = scaled - scaled.max(axis=-1, keepdims=True)
+    probabilities = np.exp(scaled) / np.exp(scaled).sum(axis=-1, keepdims=True)
+    top = probabilities.max(axis=-1)
+    sequence = ''.join(AMINO_ACIDS[i] for i in logits.argmax(axis=-1))
+    designed = int(has_residue_flag(protein.flags, ResidueFlags.DESIGN).sum())
+    templated = int(has_residue_flag(protein.flags, ResidueFlags.TEMPLATE).sum())
+ 
+    lines = [
+        f"  chain {chain_name}: {length} residues, {designed} designed, {templated} templated",
+        f"    backbone   {nonzero}/{length} residues with non-zero N/CA/C, "
+        f"{resolved}/{length} CA resolved in mask",
+        f"    geometry   centroid ({centroid[0]:.1f}, {centroid[1]:.1f}, {centroid[2]:.1f}), "
+        f"radius of gyration {radius:.1f} A",
+        f"    logits     p_max mean {top.mean():.3f} (min {top.min():.3f}, max {top.max():.3f}), "
+        f"{int((logits <= -5000).any(axis=0).sum())} omitted residue type(s)",
+        f"    argmax     {sequence}",
+    ]
+ 
+    if nonzero == 0:
+        lines.append("    WARNING    all backbone coordinates are zero; the initial guess will "
+                     "build degenerate (all-zero) rotation frames, not your fold")
+    elif radius < 1.0:
+        lines.append(f"    WARNING    radius of gyration {radius:.2f} A is collapsed; "
+                     "these are not real backbone coordinates")
+    if designed == 0:
+        lines.append("    WARNING    no residue carries DESIGN; nothing will be optimised")
+    if top.mean() > 0.9:
+        lines.append(f"    WARNING    p_max {top.mean():.3f} saturates the softmax "
+                     "(Jacobian p(1-p) < 0.09); these positions will barely move")
+    return lines
+ 
+ 
+def report_warm_start(binder: dict[str, Protein], settings: dict, targets=None) -> None:
+    """Print the warm start state once, before the first trajectory runs."""
+    global _warm_start_reported
+    if _warm_start_reported or not settings.get('warm_start_structure'):
+        return
+    _warm_start_reported = True
+ 
+    bigbang = bool(settings.get('bigbang_initialization'))
+    feedback = bool(settings.get('warm_start_feedback'))
+    guess_at_validation = bool(settings.get('initial_guess'))
+ 
+    lines = [
+        "",
+        "warm start ------------------------------------------------------------",
+        f"  source     {settings['warm_start_structure']}",
+        f"  guess      bigbang_initialization={bigbang}  "
+        f"feedback={'self-conditioning' if feedback else 'static'}",
+    ]
+    for chain_name, protein in binder.items():
+        lines += _chain_report(chain_name, protein)
+ 
+    if not bigbang:
+        lines.append("  WARNING    bigbang_initialization is off, so initial_atom_pos is never "
+                     "set and these coordinates are ignored by the structure module")
+    if guess_at_validation:
+        lines.append("  WARNING    validation will also start from a supplied pose; acceptance "
+                     "rates are not comparable to a blind refold")
+    if targets is not None:
+        for chain_name, protein in binder.items():
+            binder_centre = np.asarray(protein.atoms, dtype=np.float32)[:, _BACKBONE_ATOMS['CA']].mean(axis=0)
+            for target_name, target in targets.items():
+                target_centre = np.asarray(target.atoms, dtype=np.float32)[:, _BACKBONE_ATOMS['CA']].mean(axis=0)
+                separation = float(np.linalg.norm(binder_centre - target_centre))
+                flag = "  <-- check frames" if separation > 100.0 else ""
+                lines.append(f"  docking    chain {chain_name} to target {target_name}: "
+                             f"centroid separation {separation:.1f} A{flag}")
+    lines.append("-----------------------------------------------------------------------")
+    print("\n".join(lines), flush=True)
+ 
+

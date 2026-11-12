@@ -264,7 +264,9 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
 
     def _resolve_model_name(self, model: str | None) -> str:
         if model is None:
-            return self._sample_design_model()
+            sampled = self._sample_design_model()
+            self.last_model_used = sampled       # diagnostic: see which model answered
+            return sampled
         if model not in self.model_families:
             raise KeyError(f'model {model!r} not in the AlphaFold model pool {self.presets}')
         return model

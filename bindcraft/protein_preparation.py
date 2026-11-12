@@ -11,6 +11,7 @@ from bindcraft.design_identity import target_conformation_fingerprint
 from bindcraft.loss import DesignLoss, build_design_losses, induced_fit_binder_alone_losses, induced_fit_hinge_names, sampled_loss_weights
 from bindcraft.sequence_optimization import OMITTED_AMINO_ACID_LOGIT
 from bindcraft.settings import BinderDesignSettings, build_design_settings, resolve_validation_crop_flank, DEFAULT_IDR_CROP_LENGTHS, is_fasta
+from bindcraft.campaign_log import report_warm_start
 
 RECEPTOR_CHAIN_BREAK_GAP = 49
 
@@ -127,12 +128,48 @@ def validation_target_states(design_settings: BinderDesignSettings, target_state
 def sampled_binder_length(binder_lengths: tuple[int, ...] | None, length_random_key: Array) -> int:
     return 0 if binder_lengths is None else int(jax.random.choice(length_random_key, jnp.asarray(binder_lengths)))
 
+def warm_chain_order(warm: dict[str, Protein], binder_chain_names) -> list[str]:
+    """Binder chains of a warm start file, named ones first, else shortest first.
+
+    A designed complex holds a short binder and a long target, so length separates them
+    unambiguously when the chain ids do not match the campaign's binder_chain setting.
+    """
+    named = [name for name in binder_chain_names if name in warm]
+    return named or sorted(warm, key=lambda name: len(warm[name]))
+
 def prepare_binder_chains(design_settings: BinderDesignSettings, key: Array) -> dict[str, Protein]:
     #one key for every chain, for multi-chain binders
     length_random_key, binder_random_key = jax.random.split(key)
     binder_lengths = design_settings.binder.lengths
     binder_length = sampled_binder_length(binder_lengths, length_random_key)
-    if design_settings.binder.scaffold:
+    warm_start = design_settings.settings.get('warm_start_structure')
+    if warm_start:
+        warm_chains = structure_chain_names(warm_start)
+        warm = Protein.from_structure(warm_start, chains=','.join(warm_chains))
+        binder_chain_names = design_settings.binder_chains
+        # the binder chain in the warm start file, by name if present, else the shortest
+        # chain, which for a designed complex is unambiguously the binder
+        preferred = [name for name in warm_chain_order(warm, binder_chain_names)]
+        seeded_warm_chains = [preferred[index % len(preferred)] for index in range(len(binder_chain_names))]
+        override = design_settings.settings.get('warm_start_logits') or {}
+        binder = {}
+        for chain_name, warm_chain in zip(binder_chain_names, seeded_warm_chains):
+            protein = warm[warm_chain]
+            # from_structure already gives one-hot logits from the file's own sequence,
+            # in BindCraft's alphabet, float16 - identical to a hand-built one-hot. Only
+            # pass warm_start_logits when a multi-sequence PROFILE is wanted instead.
+            sequence = (jnp.asarray(override[warm_chain], dtype=jnp.float16)
+                        if warm_chain in override else protein.sequence)
+            # DESIGN makes it optimisable, CONTACT lets it touch the target.
+            # TEMPLATE is dropped on purpose: the fold arrives through initial_atom_pos,
+            # and templating the binder as well would double-count the prior and inflate
+            # design-time confidence. Add ResidueFlags.TEMPLATE here to test that arm.
+            binder[chain_name] = protein.replace(
+                sequence=sequence,
+                flags=jnp.full(len(protein),
+                               int(ResidueFlags.DESIGN | ResidueFlags.CONTACT),
+                               dtype=protein.flags.dtype))
+    elif design_settings.binder.scaffold:
         scaffold_chains = structure_chain_names(design_settings.binder.scaffold)
         scaffold = Protein.from_structure(design_settings.binder.scaffold, chains=','.join(scaffold_chains))
         seeded_scaffold_chains = [scaffold_chains[index % len(scaffold_chains)] for index in range(len(design_settings.binder_chains))]
@@ -151,6 +188,7 @@ def prepare_binder_chains(design_settings: BinderDesignSettings, key: Array) -> 
         #designed residues only, to hold a fold conditioning scaffold's framework
         sequence = jnp.where(has_residue_flag(protein.flags, ResidueFlags.DESIGN)[:, None], omitted_sequence, protein.sequence)
         binder[chain_name] = protein.replace(sequence=sequence, flags=protein.flags | int(ResidueFlags.CYCLIC) if design_settings.settings.get('cyclize_peptide') else protein.flags)
+    report_warm_start(binder, design_settings.settings)
     return binder
 
 def design_residue_count(settings: dict) -> int:
@@ -158,7 +196,7 @@ def design_residue_count(settings: dict) -> int:
     bucket_size = campaign_length_bucket(settings)
     #longest_crop: for disordered targets only
     targets = prepare_targets(design_settings, longest_crop=True)
-    if design_settings.binder.scaffold:
+    if design_settings.settings.get('warm_start_structure') or design_settings.binder.scaffold:
         longest_edits = re.sub(r'\(([^)]+)\)', lambda match: f'({max(parse_residue_length_choices(match.group(1)))})', design_settings.binder.scaffold_edits)
         design_settings = replace(design_settings, binder=replace(design_settings.binder, scaffold_edits=longest_edits))
         binder_length = sum(padded_prediction_length(len(protein), bucket_size) for protein in prepare_binder_chains(design_settings, jax.random.PRNGKey(design_settings.seed)).values())

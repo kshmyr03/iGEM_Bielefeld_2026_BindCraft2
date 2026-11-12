@@ -23,6 +23,9 @@ from bindcraft.trajectory_output import copy_trajectory_animation
 
 DEFAULT_TRAJECTORY_ONLY_BUDGET = 100
 
+def validation_seeds_from_given_coordinates(settings):
+    return bool(settings.get('initial_guess')) or bool(settings.get('bigbang_initialization'))
+
 def campaign_trajectory_budget(settings: dict) -> int | None:
     max_trajectories = settings.get('max_trajectories') or (DEFAULT_TRAJECTORY_ONLY_BUDGET if settings.get('trajectory_only') else None)
     arms = parameter_sweep_arms(settings)
@@ -72,8 +75,11 @@ def apply_desperation_settings(design_model, validation_model, settings: dict) -
     if design_model is not None:
         design_model.bigbang_initialization = design_seeds_from_given_coordinates(settings)
     if validation_model is not None:
-        validation_model.bigbang_initialization = validation_seeds_from_given_coordinates(settings)
-
+        # design and validation are decoupled on purpose: bigbang_initialization now
+        # governs the design model alone, so validation refolds blind unless
+        # initial_guess is set explicitly
+        validation_model.bigbang_initialization = bool(settings.get('initial_guess'))
+        
 def desperate_prediction_pools(design_model, validation_model, settings: dict, build_validation_model) -> tuple:
     selected_models = select_design_and_validation_models(settings, MULTIMER_POOL, MONOMER_POOL)
     design_model.models = tuple(model for model in selected_models.design_models if model in design_model.model_families) or design_model.models

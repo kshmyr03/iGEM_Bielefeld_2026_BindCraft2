@@ -1,6 +1,7 @@
 import math
 import os
 import jax
+import numpy as np
 from typing import Callable, NamedTuple
 from jax import Array
 from bindcraft.campaign_log import hallucination_successful, stage_outcome
@@ -15,6 +16,7 @@ from bindcraft.sequence_optimization import SequenceAnnealingOptimizer, OneHotSe
 from bindcraft.protein import recorded_number, BINDER_ALONE, Protein, StructurePrediction, StructurePredictions, ProteinStates, is_target_chain, target_chain_name, write_structure
 from bindcraft.target_schedule import DesignSchedule, FixedTargetSchedule, build_design_schedule, build_target_schedule, losses_for_active_states, rotating_round_predictions, stage_filter_predictions
 from bindcraft.settings import BinderDesignSettings, DEFAULT_SETTINGS, design_stage_rounds, merged_gradient_sequence_updates
+from bindcraft.protein import recorded_number, BINDER_ALONE, Protein, ResidueFlags, StructurePrediction, StructurePredictions, ProteinStates, has_residue_flag, is_target_chain, target_chain_name, write_structure
 
 STAGE_NAMES = ('screen', 'refine', 'anneal', 'harden')
 
@@ -101,6 +103,63 @@ def run_binder_alone_optimization_block(protein_states: ProteinStates, bound_pre
         return protein_states, bound_predictions
     return transfer_binder_sequences(protein_states, monomer_states), combined_predictions
 
+def transfer_predicted_coordinates(protein_states: ProteinStates, predictions: StructurePredictions) -> ProteinStates:
+    """Write each prediction's coordinates back onto the state that produced it.
+
+    Only DESIGN-flagged chains are written. Target coordinates must not move: `atoms`
+    feeds target_template_features as well as initial_atom_pos, so overwriting the
+    target would corrupt the template the whole run is anchored to.
+
+    stop_gradient because these arrays come out of a value_and_grad call; they are
+    inputs on the next round, never part of its gradient path.
+    """
+    updated: ProteinStates = {}
+    for state_name, protein_complex in protein_states.items():
+        prediction = predictions.get(state_name)
+        if prediction is None:
+            updated[state_name] = protein_complex
+            continue
+        updated[state_name] = {
+            name: (protein.replace(
+                       atoms=jax.lax.stop_gradient(
+                           prediction.protein_complex[name].atoms).astype(protein.atoms.dtype),
+                       atom_mask=prediction.protein_complex[name].atom_mask)
+                   if name in prediction.protein_complex
+                      and len(prediction.protein_complex[name]) == len(protein)
+                      and bool(has_residue_flag(protein.flags, ResidueFlags.DESIGN).any())
+                   else protein)
+            for name, protein in protein_complex.items()}
+    return updated
+
+_previous_guess: dict[str, "np.ndarray"] = {}
+ 
+ 
+def log_guess_drift(label: str, protein_states: ProteinStates, design_model=None) -> None:
+    """Print which model answered and how far the guess coordinates moved.
+ 
+    Only DESIGN-flagged chains are measured, because only the binder's coordinates
+    are ever written back. CA atoms only, which is enough to see motion.
+    """
+    model_name = getattr(design_model, 'last_model_used', None) if design_model is not None else None
+    for state_name, protein_complex in protein_states.items():
+        for name, protein in protein_complex.items():
+            if not bool(has_residue_flag(protein.flags, ResidueFlags.DESIGN).any()):
+                continue
+            atoms = np.asarray(protein.atoms[:, 1], dtype=np.float32)        # CA
+            key = f'{state_name}.{name}'
+            previous = _previous_guess.get(key)
+            if previous is not None and previous.shape == atoms.shape:
+                shift = float(np.sqrt(((atoms - previous) ** 2).sum(-1).mean()))
+                centroid = float(np.linalg.norm(atoms.mean(0) - previous.mean(0)))
+                radius = float(np.sqrt(((atoms - atoms.mean(0)) ** 2).sum(-1).mean()))
+                print(f'  guess[{label}] {key}: CA moved {shift:.2f} A, '
+                      f'centroid {centroid:.2f} A, Rg {radius:.1f} A'
+                      + (f', model {model_name}' if model_name else ''), flush=True)
+            elif model_name:
+                print(f'  guess[{label}] {key}: first round, model {model_name}', flush=True)
+            _previous_guess[key] = atoms
+
+
 def transfer_binder_sequences(target_states: ProteinStates, designed_states: ProteinStates) -> ProteinStates:
     return update_shared_sequences(target_states, collect_shared_chains(designed_states)[1])
 
@@ -119,7 +178,7 @@ def rotating_stage_filter_round(design_settings: BinderDesignSettings, target_sc
         return passes_design_filters(stage_filters, round_states, rotating_round_predictions(target_schedule, predictions)) is True
     return round_passes_stage_filter if stage_filters else None
 
-def run_gradient_design_stage(protein_states: ProteinStates, design_model: DifferentiableProteinPredictor, losses: dict[str, DesignLoss], sequence_optimizer: SequenceOptimizer, design_schedule: DesignSchedule, record_sequence_update: Callable[[int, StructurePredictions], None] | None=None, select_best_round: bool=True, select_filtered_round: Callable[[ProteinStates, StructurePredictions], bool] | None=None, reference_predictions: StructurePredictions | None=None, first_sequence_update: int=0, refresh_reference_predictions: Callable[[ProteinStates, int, SequenceOptimizer], StructurePredictions | None] | None=None) -> tuple[ProteinStates, StructurePredictions | None]:
+def run_gradient_design_stage(protein_states: ProteinStates, design_model: DifferentiableProteinPredictor, losses: dict[str, DesignLoss], sequence_optimizer: SequenceOptimizer, design_schedule: DesignSchedule, record_sequence_update: Callable[[int, StructurePredictions], None] | None=None, select_best_round: bool=True, select_filtered_round: Callable[[ProteinStates, StructurePredictions], bool] | None=None, reference_predictions: StructurePredictions | None=None, first_sequence_update: int=0, refresh_reference_predictions: Callable[[ProteinStates, int, SequenceOptimizer], StructurePredictions | None] | None=None, feedback_coordinates: bool=False) -> tuple[ProteinStates, StructurePredictions | None]:
     accumulated_gradients: dict[str, list[Array]] = {}
     predictions = None
     sequence_updates = first_sequence_update
@@ -129,6 +188,7 @@ def run_gradient_design_stage(protein_states: ProteinStates, design_model: Diffe
         softmax_weight, one_hot_weight, temperature, logit_scale = sequence_optimizer.sequence_parameters()
         active_losses = losses_for_active_states(losses, active_protein_states)
         predictions, chain_gradients, graph_design_loss = design_model.sequence_gradients(active_protein_states, active_losses, softmax_weight=softmax_weight, one_hot_weight=one_hot_weight, temperature=temperature, logit_scale=logit_scale, reference_predictions=reference_predictions)
+        log_guess_drift('grad', protein_states, design_model)
         design_loss = float(graph_design_loss)
         if not math.isfinite(design_loss):
             design_loss = float(weighted_design_loss(active_losses, active_protein_states, {**predictions, **(reference_predictions or {})}))
@@ -139,6 +199,12 @@ def run_gradient_design_stage(protein_states: ProteinStates, design_model: Diffe
             best_design_loss, best_protein_states, best_predictions = (design_loss, protein_states, predictions)
         if select_filtered_round is not None and select_filtered_round(protein_states, predictions):
             best_protein_states, best_predictions = (protein_states, predictions)
+        if select_filtered_round is not None and select_filtered_round(protein_states, predictions):
+            best_protein_states, best_predictions = (protein_states, predictions)
+        if feedback_coordinates:
+            protein_states = transfer_predicted_coordinates(protein_states, predictions)
+        for name, chain_gradient in chain_gradients.items():
+            accumulated_gradients.setdefault(name, []).append(chain_gradient)        
         for name, chain_gradient in chain_gradients.items():
             accumulated_gradients.setdefault(name, []).append(chain_gradient)
         if design_schedule.should_update_sequence(active_protein_states, predictions, accumulated_gradients):
@@ -300,7 +366,7 @@ def run_trajectory(design_settings: BinderDesignSettings, design_model: Differen
         trajectory = run_stage_operations(stage.prepare, trajectory)
         design_model.dropout = stage.dropout and settings.get('design_dropout', DEFAULT_SETTINGS['design_dropout'])
         design_schedule = build_design_schedule(design_settings, trajectory.design_target_states, trajectory.losses, stage.sequence_optimizer.iterations, conformation_random_key, False, target_schedule, stage.name)
-        protein_states, predictions = run_gradient_design_stage(trajectory.protein_states, design_model, sequence_optimizer=stage.sequence_optimizer, design_schedule=design_schedule, record_sequence_update=recorder, select_best_round=len(design_settings.prepared_states) < 2, select_filtered_round=rotating_stage_filter_round(design_settings, target_schedule, trajectory.protein_states, stage.name), **induced_fit_reference_arguments(trajectory.losses, trajectory.binder_alone_reference, design_model, design_settings))
+        protein_states, predictions = run_gradient_design_stage(trajectory.protein_states, design_model, sequence_optimizer=stage.sequence_optimizer, design_schedule=design_schedule, record_sequence_update=recorder, select_best_round=len(design_settings.prepared_states) < 2, select_filtered_round=rotating_stage_filter_round(design_settings, target_schedule, trajectory.protein_states, stage.name), feedback_coordinates=bool(settings.get('warm_start_feedback')), **induced_fit_reference_arguments(trajectory.losses, trajectory.binder_alone_reference, design_model, design_settings))
         if predictions is None:
             trajectory = trajectory._replace(predictions={}, failed=('no finite round',))
         else:
@@ -316,6 +382,7 @@ def run_trajectory(design_settings: BinderDesignSettings, design_model: Differen
             break
     protein_states, predictions, losses = trajectory.protein_states, trajectory.predictions, trajectory.losses
     if failed_stage is None and design_stage_rounds(settings)['mutate']:
+        #design_model.bigbang_initialization = False
         protein_states, predictions, failed_stage = run_mutation_polish(design_settings, design_model, protein_states, wild_type_states, losses, trajectory.binder_alone_reference, multi_chain_binders, mutation_random_key, conformation_random_key, target_names, recorder)
     if failed_stage is None:
         stage_filters = design_stage_filters(design_settings, protein_states, 'final')

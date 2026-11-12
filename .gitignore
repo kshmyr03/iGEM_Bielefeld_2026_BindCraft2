@@ -50,3 +50,11 @@ Thumbs.db
 
 # Anything created by Claude
 .claude/
+results/
+logs/
+warm_start/
+*.log
+__pycache__/
+*.egg-info/
+*.tar.gz
+myJSONs/
