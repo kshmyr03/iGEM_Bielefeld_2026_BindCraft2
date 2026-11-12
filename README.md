@@ -1,5 +1,34 @@
 ![BC2 — protein binder design](docs/.assets/bc2_header.png)
 
+# BindCraft2: iGEM Bielefeld 2026 warm-start modification
+ 
+**Who we are.** This repository is maintained by **iGEM Bielefeld 2026**. It is a modified copy of [PacesaLab/BindCraft2](https://github.com/PacesaLab/BindCraft2), not the official release. For the upstream project, please use that repository.
+ 
+**What it is based on.** Everything here sits on upstream commit [`301efdd`](https://github.com/PacesaLab/BindCraft2/commit/301efdd) (24 September 2026). No changes from later upstream releases are included.
+ 
+**What we changed: a warm start.** BindCraft2 normally designs every binder from scratch, beginning from a random sequence with no structure behind it. Our modification lets you give it a protein you already have and start the design from there instead. This makes step-by-step improvement possible: take the result of one design run and feed it into the next, rather than starting over from nothing each time.
+ 
+| Setting | What it does |
+| --- | --- |
+| `warm_start_structure` | Path to a PDB or mmCIF file. Its binder chain seeds the design: the sequence comes from the file, and the coordinates are handed to AlphaFold as `initial_atom_pos`. Chains are matched by name when they match the campaign's `binder_chain`, otherwise the shortest chain is taken as the binder. |
+| `warm_start_logits` | Optional. Supply a sequence profile per chain instead of the one-hot sequence read from the file. |
+| `warm_start_feedback` | Optional self-conditioning. Each round's predicted coordinates are written back onto the design state before the next round, so the trajectory refines from where it just landed. Only `DESIGN`-flagged chains are written; target coordinates are never moved. |
+ 
+A diagnostic block prints once, on the first trajectory, reporting backbone completeness, radius of gyration, softmax saturation and the seeded sequence. So a misconfigured warm start is visible immediately instead of after a full campaign.
+ 
+**Two things worth knowing before you use it:**
+ 
+- `bigbang_initialization` must be `true` for the supplied coordinates to reach the structure module. Without it only the sequence is seeded, and the run behaves like a de novo campaign with a starting sequence.
+- Validation deliberately refolds **blind**: it is not given the supplied pose unless `initial_guess` is set explicitly. A validation refold that is handed the answer is not a validation, and acceptance rates would not be comparable to an ordinary run.
+Changed files: `bindcraft/af2.py`, `bindcraft/campaign.py`, `bindcraft/campaign_log.py`, `bindcraft/protein_preparation.py`, `bindcraft/settings.py`, `bindcraft/trajectory.py`.
+ 
+Full diff against unmodified BindCraft2: [`301efdd...main`](https://github.com/kshmyr03/iGEM_Bielefeld_2026_BindCraft2/compare/301efdd...main)
+ 
+---
+ 
+Everything below is the upstream BindCraft2 README, unchanged.
+ 
+ 
 # BindCraft2
 
 **Design protein binders around the biology of your experiment.**
@@ -159,8 +188,8 @@ Add a compatible property as a command-line flag or a top-level JSON entry:
 | **Mixed topology** — select for beta-sheet content and limit helicity | `--mixed-topology` | `"mixed_topology": true` |
 | **Nearby termini** — bring the N and C termini together | `--termini-together` | `"termini_together": true` |
 | **Accessible termini** — direct both chain ends away from the target | `--termini-accessible` | `"termini_accessible": true` |
-| **Initial guess** — re-predict each candidate from the pose the trajectory folded | `--initial-guess` | `"initial_guess": true` |
-| **Big bang** — seed the gradient stages too, so a binder folded from nothing starts at the origin | `--bigbang` | `"bigbang": true` |
+| **Hard target** — re-predict each candidate from the pose the trajectory folded | `--hard-target` | `"hard_target": true` |
+| **Large complex** — seed the gradient stages too, so a binder folded from nothing starts at the origin | `--large-complex` | `"large_complex": true` |
 
 For example:
 
@@ -168,7 +197,7 @@ For example:
 bindcraft design examples/pdl1.json --mixed-topology --set 'project_folder=results/pdl1_mixed'
 ```
 
-These properties are judged using computational proxies. See [property objectives and acceptance filters](docs/source/reference.md#property-objectives-and-acceptance-filters) for what each one measures and requires, and [starting conformations](docs/source/reference.md#starting-conformations) for the optional `--initial-guess` and `--bigbang` flags.
+These properties are judged using computational proxies. See [property objectives and acceptance filters](docs/source/reference.md#property-objectives-and-acceptance-filters) for what each one measures and requires, and [starting conformations](docs/source/reference.md#starting-conformations) for the optional `--hard-target` and `--large-complex` flags.
 
 ### Combining modalities
 
